@@ -15,8 +15,12 @@ PREFERRED_SERVER_IP = "192.168.4.228"
 FALLBACK_SERVER_HOST = "hb-server"
 NODE_PORT = 3030
 
-# Optional host override: if non-empty, replace any host field in outgoing messages
+# Optional host override: if non-empty, replace any host field in outgoing messages when falling back
 OVERWRITE_HOST = ""
+
+# Friendly name for this client (sent on registration)
+CLIENT_NAME = socket.gethostname()
+
 
 def _select_node_host():
     for host in (PREFERRED_SERVER_IP, FALLBACK_SERVER_HOST):
@@ -29,8 +33,43 @@ def _select_node_host():
     print(f"[{datetime.now()}] Failed to connect to Node server at both preferred and fallback hosts.")
     sys.exit(1)
 
+
 SELECTED_NODE_HOST = _select_node_host()
+# If we fell back and have an overwrite configured, we'll use it
+USE_OVERRIDE = (SELECTED_NODE_HOST == FALLBACK_SERVER_HOST and bool(OVERWRITE_HOST))
 NODE_BASE_URL = f"http://{SELECTED_NODE_HOST}:{NODE_PORT}"
+
+
+def register_client():
+    """
+    Inform the Node server of our presence: send CLIENT_NAME + our address.
+    If on preferred IP: address = our local interface IP.
+    If on fallback: address = OVERWRITE_HOST.
+    """
+    if USE_OVERRIDE:
+        address = OVERWRITE_HOST
+    else:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((SELECTED_NODE_HOST, NODE_PORT))
+            address = s.getsockname()[0]
+            s.close()
+        except Exception:
+            address = ""
+    payload = {
+        "friendlyName": CLIENT_NAME,
+        "address": address
+    }
+    url = f"{NODE_BASE_URL}/register_client"
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code == 200:
+            print(f"[{datetime.now()}] Registered client '{CLIENT_NAME}' with address '{address}'")
+        else:
+            print(f"[{datetime.now()}] Client registration failed {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[{datetime.now()}] Error registering client: {e}")
+
 
 # Globals for debouncing `recent_stats`
 latest_recent_stats_payload = None
@@ -45,20 +84,10 @@ inference_outbox_queue = queue.Queue()
 
 
 def process_trial_outbox():
-    """
-    Fetch rows from the outbox_trial table in batches, send them to the Node server,
-    and delete rows upon successful processing.
-    """
     conn = None
     BATCH_SIZE = 10
-
     try:
-        conn = psycopg2.connect(
-            dbname="base",
-            user="postgres",
-            password="postgres",
-            host="localhost"
-        )
+        conn = psycopg2.connect(dbname="base", user="postgres", password="postgres", host="localhost")
         conn.autocommit = True
 
         while True:
@@ -73,15 +102,14 @@ def process_trial_outbox():
                 break
 
             print(f"[{datetime.now()}] Processing batch of {len(rows)} trials from outbox_trial...")
-
             columns = [desc[0] for desc in cur.description]
             trials = []
             for row in rows:
                 trial = {
-                    col: (value.isoformat() if isinstance(value, datetime) else value)
-                    for col, value in zip(columns, row)
+                    col: (val.isoformat() if isinstance(val, datetime) else val)
+                    for col, val in zip(columns, row)
                 }
-                if OVERWRITE_HOST and "host" in trial:
+                if USE_OVERRIDE and "host" in trial:
                     trial["host"] = OVERWRITE_HOST
                 trials.append(trial)
 
@@ -89,8 +117,7 @@ def process_trial_outbox():
             response = requests.post(node_url, json={"rows": trials}, timeout=10)
 
             if response.status_code == 200:
-                response_data = response.json()
-                processed_rows = response_data.get("processedRows", [])
+                processed_rows = response.json().get("processedRows", [])
                 if processed_rows:
                     print(f"[{datetime.now()}] Server processed {len(processed_rows)} trials.")
                     with conn.cursor() as cur:
@@ -101,42 +128,29 @@ def process_trial_outbox():
                         )
                         print(f"[{datetime.now()}] Deleted {cur.rowcount} rows from outbox_trial.")
                 else:
-                    print(f"[{datetime.now()}] Server reported no trial rows were processed for this batch.")
+                    print(f"[{datetime.now()}] No trial rows processed for this batch.")
             else:
-                print(f"[{datetime.now()}] Node server returned error {response.status_code}: {response.text}")
+                print(f"[{datetime.now()}] Node server error {response.status_code}: {response.text}")
                 break
 
             if len(rows) < BATCH_SIZE:
                 break
 
-    except psycopg2.Error as e:
-        print(f"[{datetime.now()}] Database error in process_trial_outbox: {e}")
-    except requests.RequestException as e:
-        print(f"[{datetime.now()}] Error sending data to Node server in process_trial_outbox: {e}")
     except Exception as e:
-        print(f"[{datetime.now()}] Unexpected error in process_trial_outbox: {e}")
+        print(f"[{datetime.now()}] process_trial_outbox error: {e}")
     finally:
         if conn:
             conn.close()
 
 
 def process_inference_outbox():
-    """
-    Fetch rows from the outbox_inference table in batches, send them to the Node server,
-    and delete rows upon successful processing.
-    """
     conn = None
     BATCH_SIZE = 50
     total_processed = 0
     start_time = datetime.now()
 
     try:
-        conn = psycopg2.connect(
-            dbname="base",
-            user="postgres",
-            password="postgres",
-            host="localhost"
-        )
+        conn = psycopg2.connect(dbname="base", user="postgres", password="postgres", host="localhost")
         conn.autocommit = True
 
         while True:
@@ -156,14 +170,14 @@ def process_inference_outbox():
             inferences = []
             for row in rows:
                 inf = {}
-                for col, value in zip(columns, row):
-                    if isinstance(value, datetime):
-                        inf[col] = value.isoformat()
-                    elif isinstance(value, memoryview):
-                        inf[col] = base64.b64encode(bytes(value)).decode('utf-8')
+                for col, val in zip(columns, row):
+                    if isinstance(val, datetime):
+                        inf[col] = val.isoformat()
+                    elif isinstance(val, memoryview):
+                        inf[col] = base64.b64encode(bytes(val)).decode('utf-8')
                     else:
-                        inf[col] = value
-                if OVERWRITE_HOST and "host" in inf:
+                        inf[col] = val
+                if USE_OVERRIDE and "host" in inf:
                     inf["host"] = OVERWRITE_HOST
                 inferences.append(inf)
 
@@ -172,12 +186,11 @@ def process_inference_outbox():
             response = requests.post(node_url, json={"rows": inferences}, timeout=20)
 
             if response.status_code == 200:
-                response_data = response.json()
-                processed = response_data.get("processedRows", [])
+                processed = response.json().get("processedRows", [])
                 print(f"[{datetime.now()}] Server processed {len(processed)} rows successfully.")
                 if processed:
+                    ids = [r["infer_id"] for r in processed]
                     with conn.cursor() as cur:
-                        ids = [r["infer_id"] for r in processed]
                         cur.execute(
                             "DELETE FROM outbox_inference WHERE infer_id = ANY(%s);",
                             (ids,)
@@ -185,7 +198,7 @@ def process_inference_outbox():
                         total_processed += len(processed)
                         print(f"[{datetime.now()}] Deleted {len(processed)} rows. Total: {total_processed}")
             else:
-                print(f"[{datetime.now()}] Node server returned error {response.status_code}: {response.text}")
+                print(f"[{datetime.now()}] Node server error {response.status_code}: {response.text}")
                 break
 
             if len(rows) < BATCH_SIZE:
@@ -194,29 +207,16 @@ def process_inference_outbox():
         duration = (datetime.now() - start_time).total_seconds()
         print(f"[{datetime.now()}] Finished inference cycle: {total_processed} rows in {duration:.2f}s")
 
-    except psycopg2.Error as e:
-        print(f"[{datetime.now()}] Database error in process_inference_outbox: {e}")
-    except requests.RequestException as e:
-        print(f"[{datetime.now()}] Request error in process_inference_outbox: {e}")
     except Exception as e:
-        print(f"[{datetime.now()}] Unexpected error in process_inference_outbox: {e}")
+        print(f"[{datetime.now()}] process_inference_outbox error: {e}")
     finally:
         if conn:
             conn.close()
 
 
 def send_entire_status_to_node():
-    """
-    Periodically copies the entire `status` table to the server to ensure synchronization.
-    """
-    conn = psycopg2.connect(
-        dbname="base",
-        user="postgres",
-        password="postgres",
-        host="localhost"
-    )
+    conn = psycopg2.connect(dbname="base", user="postgres", password="postgres", host="localhost")
     conn.autocommit = True
-
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM status WHERE status_type != 'system_script';")
@@ -229,99 +229,69 @@ def send_entire_status_to_node():
         statuses = []
         for row in rows:
             s = {
-                col: (value.isoformat() if isinstance(value, datetime) else value)
-                for col, value in zip(columns, row)
+                col: (val.isoformat() if isinstance(val, datetime) else val)
+                for col, val in zip(columns, row)
             }
-            if OVERWRITE_HOST and "host" in s:
+            if USE_OVERRIDE and "host" in s:
                 s["host"] = OVERWRITE_HOST
             statuses.append(s)
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
         response = requests.post(node_url, json={"rows": statuses}, timeout=5)
-        if response.status_code == 200:
-            print("Status data successfully sent.")
-        else:
-            print(f"Node server returned error {response.status_code}: {response.text}")
+        if response.status_code != 200:
+            print(f"Node server error {response.status_code}: {response.text}")
 
-    except psycopg2.Error as e:
-        print(f"Error querying status table: {e}")
-    except requests.RequestException as e:
-        print(f"Error sending status data: {e}")
+    except Exception as e:
+        print(f"[{datetime.now()}] send_entire_status_to_node error: {e}")
     finally:
         conn.close()
 
 
 def send_status_to_node(payload):
-    """
-    Process the most recent payload and send it to the Node server for `status`.
-    """
     if not payload:
-        print("No status payload to send.")
         return
-
     try:
         status_data = json.loads(payload)
-        if OVERWRITE_HOST and isinstance(status_data, dict) and "host" in status_data:
+        if USE_OVERRIDE and isinstance(status_data, dict) and "host" in status_data:
             status_data["host"] = OVERWRITE_HOST
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
         response = requests.post(node_url, json={"rows": [status_data]}, timeout=5)
-        if response.status_code == 200:
-            print("Status data successfully sent.")
-        else:
-            print(f"Node server returned error {response.status_code}: {response.text}")
+        if response.status_code != 200:
+            print(f"Node server error {response.status_code}: {response.text}")
 
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON payload: {e}")
-    except requests.RequestException as e:
-        print(f"Error sending status data: {e}")
+    except Exception as e:
+        print(f"[{datetime.now()}] send_status_to_node error: {e}")
 
 
 def send_recent_stats_to_node():
-    """
-    Process the most recent payload and send it to the Node server for `recent_stats`.
-    """
     global latest_recent_stats_payload
     with recent_stats_debounce_lock:
         payload = latest_recent_stats_payload
         latest_recent_stats_payload = None
 
     if not payload:
-        print("No recent_stats payload to send.")
         return
-
     try:
         recent_stats_data = json.loads(payload)
-        if OVERWRITE_HOST:
-            if isinstance(recent_stats_data, list):
-                for row in recent_stats_data:
-                    if isinstance(row, dict) and "host" in row:
-                        row["host"] = OVERWRITE_HOST
-            elif isinstance(recent_stats_data, dict) and "host" in recent_stats_data:
-                recent_stats_data["host"] = OVERWRITE_HOST
+        rows = recent_stats_data if isinstance(recent_stats_data, list) else [recent_stats_data]
+        for rec in rows:
+            if USE_OVERRIDE and "host" in rec:
+                rec["host"] = OVERWRITE_HOST
 
         node_url = f"{NODE_BASE_URL}/upsert_recent_stats"
-        response = requests.post(node_url, json={"rows": recent_stats_data}, timeout=5)
-        if response.status_code == 200:
-            print("Recent stats successfully sent.")
-        else:
-            print(f"Node server returned error {response.status_code}: {response.text}")
+        response = requests.post(node_url, json={"rows": rows}, timeout=5)
+        if response.status_code != 200:
+            print(f"Node server error {response.status_code}: {response.text}")
 
-    except json.JSONDecodeError as e:
-        print(f"Error decoding recent_stats payload: {e}")
-    except requests.RequestException as e:
-        print(f"Error sending recent_stats data: {e}")
+    except Exception as e:
+        print(f"[{datetime.now()}] send_recent_stats_to_node error: {e}")
 
 
 def update_recent_stats(conn, payload):
-    """
-    Handles the `copy_recent_stats` notification with debounce.
-    """
-    print(f"[{datetime.now()}] Received payload for copy_recent_stats.")
     global latest_recent_stats_payload, recent_stats_debounce_timer
     with recent_stats_debounce_lock:
         latest_recent_stats_payload = payload
-
     if recent_stats_debounce_timer:
         recent_stats_debounce_timer.cancel()
     recent_stats_debounce_timer = threading.Timer(DEBOUNCE_DURATION, send_recent_stats_to_node)
@@ -329,31 +299,19 @@ def update_recent_stats(conn, payload):
 
 
 def periodic_status_sync():
-    """
-    Calls send_entire_status_to_node once per minute.
-    """
     while True:
         try:
             send_entire_status_to_node()
         except Exception as e:
-            print(f"Error in periodic status sync: {e}")
+            print(f"[{datetime.now()}] periodic_status_sync error: {e}")
         time.sleep(60)
 
 
 def handle_image_notification(image_type: str):
-    """
-    Fetches image-related status data from the 'status' table based on image_type
-    and sends it to the Node server.
-    """
     print(f"[{datetime.now()}] Processing '{image_type}' notification.")
     conn = None
     try:
-        conn = psycopg2.connect(
-            dbname="base",
-            user="postgres",
-            password="postgres",
-            host="localhost"
-        )
+        conn = psycopg2.connect(dbname="base", user="postgres", password="postgres", host="localhost")
         conn.autocommit = True
 
         with conn.cursor() as cur:
@@ -370,85 +328,53 @@ def handle_image_notification(image_type: str):
 
         columns = [desc[0] for desc in cur.description]
         image_data = {
-            col: (value.isoformat() if isinstance(value, datetime) else value)
-            for col, value in zip(columns, row)
+            col: (val.isoformat() if isinstance(val, datetime) else val)
+            for col, val in zip(columns, row)
         }
-        if OVERWRITE_HOST and "host" in image_data:
+        if USE_OVERRIDE and "host" in image_data:
             image_data["host"] = OVERWRITE_HOST
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
         response = requests.post(node_url, json={"rows": [image_data]}, timeout=10)
-        if response.status_code == 200:
-            print(f"Successfully sent '{image_type}' data.")
-        else:
-            print(f"Node server returned error {response.status_code}: {response.text}")
+        if response.status_code != 200:
+            print(f"Node server error {response.status_code}: {response.text}")
 
-    except psycopg2.Error as e:
-        print(f"Database error processing '{image_type}': {e}")
-    except requests.RequestException as e:
-        print(f"Error sending '{image_type}' data: {e}")
+    except Exception as e:
+        print(f"[{datetime.now()}] handle_image_notification error: {e}")
     finally:
         if conn:
             conn.close()
 
 
 def inference_outbox_worker():
-    """
-    Worker thread that processes items from the inference_outbox_queue.
-    """
     consecutive_errors = 0
     while True:
         try:
             inference_outbox_queue.get()
-            print(f"[{datetime.now()}] Inference worker woken up.")
-
             drained = 0
             while not inference_outbox_queue.empty():
                 inference_outbox_queue.get_nowait()
                 drained += 1
-            if drained:
-                print(f"[{datetime.now()}] Drained {drained} additional notifications.")
-
             process_inference_outbox()
             consecutive_errors = 0
             if drained:
                 continue
-
             time.sleep(0.1)
-
-        except psycopg2.Error as db_err:
-            consecutive_errors += 1
-            backoff = min(30, 2 ** consecutive_errors)
-            print(f"[{datetime.now()}] DB error: {db_err}. Backing off {backoff}s.")
-            time.sleep(backoff)
-        except requests.RequestException as req_err:
-            consecutive_errors += 1
-            backoff = min(30, 2 ** consecutive_errors)
-            print(f"[{datetime.now()}] Req error: {req_err}. Backing off {backoff}s.")
-            time.sleep(backoff)
         except Exception as e:
             consecutive_errors += 1
             backoff = min(30, 2 ** consecutive_errors)
-            print(f"[{datetime.now()}] Unexpected error: {e}. Backing off {backoff}s.")
+            print(f"[{datetime.now()}] inference_outbox_worker error: {e}, backing off {backoff}s")
             time.sleep(backoff)
 
 
 def listen():
-    conn = psycopg2.connect(
-        dbname="base",
-        user="postgres",
-        password="postgres",
-        host="localhost"
-    )
+    conn = psycopg2.connect(dbname="base", user="postgres", password="postgres", host="localhost")
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
-    cur.execute("LISTEN empty_outbox_trial;")
-    cur.execute("LISTEN empty_outbox_inference;")
-    cur.execute("LISTEN copy_status;")
-    cur.execute("LISTEN copy_status_oversized;")
-    cur.execute("LISTEN copy_recent_stats;")
-    cur.execute("LISTEN new_image;")
-
+    for ch in ("empty_outbox_trial", "empty_outbox_inference",
+               "copy_status", "copy_status_oversized",
+               "copy_recent_stats", "new_image"):
+        cur.execute(f"LISTEN {ch};")
     print("Now listening for postgres notifications...")
 
     try:
@@ -472,12 +398,9 @@ def listen():
                         t = notify.payload
                         if t in ('photo_cartoon', 'screenshot'):
                             threading.Thread(target=handle_image_notification, args=(t,), daemon=True).start()
-                        else:
-                            print(f"Ignored image_type: {t}")
                     elif notify.channel == "copy_recent_stats":
                         threading.Thread(target=update_recent_stats, args=(conn, notify.payload), daemon=True).start()
-                    elif notify.channel == "copy_status_oversized":
-                        print("Oversized status payload; ignoring.")
+                    # ignore copy_status_oversized
     except KeyboardInterrupt:
         print("\nTerminating listener.")
     finally:
@@ -488,6 +411,7 @@ def listen():
 
 if __name__ == "__main__":
     print(f"[{datetime.now()}] Starting process_pg_notify.py...")
+    register_client()
     print(f"[{datetime.now()}] Initial inference outbox processing...")
     process_inference_outbox()
     print("Initial outbox processing complete.")
