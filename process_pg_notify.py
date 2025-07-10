@@ -10,20 +10,24 @@ import time
 import queue
 import base64
 
-# Server configuration
-PREFERRED_SERVER_IP = "192.168.4.228"
+# Network configuration for connecting to the Node.js server.
+# The script first attempts to connect on the local network. If that fails, it uses a fallback host.
+LAN_SERVER_IP = "192.168.4.228"
 FALLBACK_SERVER_HOST = "hb-server"
 NODE_PORT = 3030
 
-# Optional host override: if non-empty, replace any host field in outgoing messages when falling back
-OVERWRITE_HOST = ""
+# When using the fallback host, we may need to specify the client's address manually.
+# This is for cases where the client is on a different network (e.g., Tailscale)
+# and its local IP is not reachable from the server. The server will use this address
+# to communicate back to the client.
+FALLBACK_CLIENT_ADDRESS_OVERRIDE = ""
 
 # Friendly name for this client (sent on registration)
 CLIENT_NAME = socket.gethostname()
 
 
 def _select_node_host():
-    for host in (PREFERRED_SERVER_IP, FALLBACK_SERVER_HOST):
+    for host in (LAN_SERVER_IP, FALLBACK_SERVER_HOST):
         try:
             socket.create_connection((host, NODE_PORT), timeout=1).close()
             print(f"[{datetime.now()}] Selected Node server host: {host}")
@@ -35,19 +39,19 @@ def _select_node_host():
 
 
 SELECTED_NODE_HOST = _select_node_host()
-# If we fell back and have an overwrite configured, we'll use it
-USE_OVERRIDE = (SELECTED_NODE_HOST == FALLBACK_SERVER_HOST and bool(OVERWRITE_HOST))
+# We'll use the address override if we're on the fallback host and an override is set.
+USE_OVERRIDE = (SELECTED_NODE_HOST == FALLBACK_SERVER_HOST and bool(FALLBACK_CLIENT_ADDRESS_OVERRIDE))
 NODE_BASE_URL = f"http://{SELECTED_NODE_HOST}:{NODE_PORT}"
 
 
 def register_client():
     """
     Inform the Node server of our presence: send CLIENT_NAME + our address.
-    If on preferred IP: address = our local interface IP.
-    If on fallback: address = OVERWRITE_HOST.
+    If on LAN: address = our local interface IP.
+    If on fallback: address = FALLBACK_CLIENT_ADDRESS_OVERRIDE.
     """
     if USE_OVERRIDE:
-        address = OVERWRITE_HOST
+        address = FALLBACK_CLIENT_ADDRESS_OVERRIDE
     else:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -110,7 +114,7 @@ def process_trial_outbox():
                     for col, val in zip(columns, row)
                 }
                 if USE_OVERRIDE and "host" in trial:
-                    trial["host"] = OVERWRITE_HOST
+                    trial["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
                 trials.append(trial)
 
             node_url = f"{NODE_BASE_URL}/process_outbox_trial"
@@ -178,7 +182,7 @@ def process_inference_outbox():
                     else:
                         inf[col] = val
                 if USE_OVERRIDE and "host" in inf:
-                    inf["host"] = OVERWRITE_HOST
+                    inf["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
                 inferences.append(inf)
 
             node_url = f"{NODE_BASE_URL}/process_outbox_inference"
@@ -233,7 +237,7 @@ def send_entire_status_to_node():
                 for col, val in zip(columns, row)
             }
             if USE_OVERRIDE and "host" in s:
-                s["host"] = OVERWRITE_HOST
+                s["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
             statuses.append(s)
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
@@ -253,7 +257,7 @@ def send_status_to_node(payload):
     try:
         status_data = json.loads(payload)
         if USE_OVERRIDE and isinstance(status_data, dict) and "host" in status_data:
-            status_data["host"] = OVERWRITE_HOST
+            status_data["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
         response = requests.post(node_url, json={"rows": [status_data]}, timeout=5)
@@ -277,7 +281,7 @@ def send_recent_stats_to_node():
         rows = recent_stats_data if isinstance(recent_stats_data, list) else [recent_stats_data]
         for rec in rows:
             if USE_OVERRIDE and "host" in rec:
-                rec["host"] = OVERWRITE_HOST
+                rec["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
 
         node_url = f"{NODE_BASE_URL}/upsert_recent_stats"
         response = requests.post(node_url, json={"rows": rows}, timeout=5)
@@ -332,7 +336,7 @@ def handle_image_notification(image_type: str):
             for col, val in zip(columns, row)
         }
         if USE_OVERRIDE and "host" in image_data:
-            image_data["host"] = OVERWRITE_HOST
+            image_data["host"] = FALLBACK_CLIENT_ADDRESS_OVERRIDE
 
         node_url = f"{NODE_BASE_URL}/upsert_status"
         response = requests.post(node_url, json={"rows": [image_data]}, timeout=10)
